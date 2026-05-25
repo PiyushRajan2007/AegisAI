@@ -39,3 +39,4 @@ class User(Base):
     documents = relationship("Document", back_populates="owner")
     webhook_configs = relationship("WebhookConfig", back_populates="user")
     notifications    = relationship("Notification",    back_populates="user")
+    rag_documents = relationship("RagDocument", back_populates="uploaded_by")

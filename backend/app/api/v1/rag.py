@@ -5,14 +5,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 TODO for contributors (high difficulty):
   - Pre-load the EU AI Act, GDPR, ISO 42001, and NIST AI RMF as source documents
-  - Add a POST /rag/ingest endpoint for uploading custom regulatory PDFs
   - Add streaming responses via SSE for long answers
+  - Implement document version tracking and re-ingestion workflows
 """
 
 import time
-from fastapi import APIRouter, Depends, HTTPException, status
-
-
 import os
 import shutil
 import tempfile
@@ -25,8 +22,12 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.rag_feedback import RAGFeedback
+from app.models.rag_document import RagDocument, RagDocumentChunk
 from app.models.user import SubscriptionTier, User
-from app.modules.rag.document_loader import load_documents_from_paths
+from app.modules.rag.document_loader import (
+    load_documents_from_paths,
+    load_documents_from_paths_with_metadata,
+)
 from app.modules.rag.vector_store import create_vector_store
 from app.models.rag_query import RagQuery
 
@@ -52,6 +53,55 @@ class RAGIngestResponse(BaseModel):
     index_size_bytes: int
 
 
+class RagDocumentResponse(BaseModel):
+    """Response model for a RAG document with metadata."""
+    
+    id: int
+    filename: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    file_size_bytes: int
+    chunks_count: int
+    document_type: Optional[str] = None
+    embedding_model: Optional[str] = None
+    is_indexed: bool
+    created_at: str
+    
+    class Config:
+        from_attributes = True
+
+
+class RagDocumentListResponse(BaseModel):
+    """Response model for listing RAG documents."""
+    
+    documents: list[RagDocumentResponse]
+    total_count: int
+
+
+class RagDocumentChunkResponse(BaseModel):
+    """Response model for a RAG document chunk."""
+    
+    id: int
+    chunk_index: int
+    content_hash: Optional[str] = None
+    faiss_id: Optional[str] = None
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
+    created_at: str
+    
+    class Config:
+        from_attributes = True
+
+
+class RagDocumentChunksResponse(BaseModel):
+    """Response model for listing chunks of a RAG document."""
+    
+    document_id: int
+    filename: str
+    chunks: list[RagDocumentChunkResponse]
+    total_chunks: int
+
+
 # ---------------------------------------------------------------------------
 # POST /rag/ingest
 # ---------------------------------------------------------------------------
@@ -64,11 +114,12 @@ class RAGIngestResponse(BaseModel):
 def ingest_documents(
     files: List[UploadFile] = File(..., description="One or more PDF files to ingest"),
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Accept one or more PDF uploads, process them through the document loader,
-    build (or rebuild) the FAISS vector index, and persist it to
-    ``settings.FAISS_INDEX_PATH``.
+    build (or rebuild) the FAISS vector index, persist it to
+    ``settings.FAISS_INDEX_PATH``, and register documents in the database.
 
     **Returns**
     - ``files_processed`` - number of PDFs successfully saved and chunked
@@ -103,8 +154,8 @@ def ingest_documents(
                 shutil.copyfileobj(upload.file, buf)
             saved_paths.append(dest)
 
-        # ── 3. Chunk documents (gives us the accurate chunk count) ────────
-        chunks = load_documents_from_paths(saved_paths)
+        # ── 3. Chunk documents with metadata ─────────────────────────────
+        chunks, chunks_metadata = load_documents_from_paths_with_metadata(saved_paths)
         if not chunks:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -121,7 +172,55 @@ def ingest_documents(
                 detail=f"Failed to build FAISS index: {exc}",
             )
 
-        # ── 5. Calculate on-disk index size ───────────────────────────────
+        # ── 5. Register documents and chunks in the database ──────────────
+        embedding_model = settings.LLM_MODEL
+        
+        for file_path in saved_paths:
+            filename = os.path.basename(file_path)
+            file_size_bytes = os.path.getsize(file_path)
+            
+            # Create RagDocument record
+            rag_document = RagDocument(
+                filename=filename,
+                file_path=file_path,
+                file_size_bytes=file_size_bytes,
+                title=filename.replace(".pdf", "").replace("_", " "),
+                chunks_count=0,  # Will be updated below
+                embedding_model=embedding_model,
+                document_type="CUSTOM",  # Default to CUSTOM; can be updated by admin
+                uploaded_by_id=current_user.id,
+                is_indexed=False,  # Will be set to True after chunks are created
+                index_version="1.0",
+            )
+            db.add(rag_document)
+            db.flush()  # Flush to get the document ID
+            
+            # Get metadata for this file
+            file_metadata = chunks_metadata.get(filename, {})
+            chunk_info_list = file_metadata.get("chunks", [])
+            
+            # Create RagDocumentChunk records for each chunk
+            for idx, chunk_info in enumerate(chunk_info_list):
+                rag_chunk = RagDocumentChunk(
+                    document_id=rag_document.id,
+                    chunk_index=idx,
+                    content="",  # Content is stored in FAISS, not in DB for performance
+                    content_hash=chunk_info.get("content_hash", ""),
+                    faiss_id=f"{rag_document.id}_{idx}",  # Use document_id_chunk_idx format
+                    embedding_vector_dim=1536,  # OpenAI embeddings dimension
+                    start_page=chunk_info.get("page", 0),
+                    end_page=chunk_info.get("page", 0),
+                )
+                db.add(rag_chunk)
+            
+            # Update chunk count and mark as indexed
+            rag_document.chunks_count = len(chunk_info_list)
+            rag_document.is_indexed = True
+        
+        # Commit all database changes
+        db.commit()
+
+        # ── 6. Calculate on-disk index size ───────────────────────────────
         index_path = settings.FAISS_INDEX_PATH
         index_size_bytes = 0
         for fname in ("index.faiss", "index.pkl"):
@@ -135,8 +234,17 @@ def ingest_documents(
             index_size_bytes=index_size_bytes,
         )
 
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Ingestion failed: {str(e)}",
+        )
     finally:
-        # ── 6. Always clean up the temp directory ─────────────────────────
+        # ── 7. Always clean up the temp directory ─────────────────────────
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -212,6 +320,178 @@ def query_knowledge_base(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"RAG module error: {str(e)}",
+        )
+
+
+@router.get(
+    "/ingest/documents",
+    response_model=RagDocumentListResponse,
+    summary="List all ingested regulatory documents",
+    tags=["RAG Intelligence"],
+)
+def list_ingested_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Retrieve a list of all uploaded regulatory documents with their metadata.
+    
+    **Returns**
+    - List of documents with: id, filename, title, chunks_count, document_type, etc.
+    - Total count of documents
+    """
+    documents = db.query(RagDocument).all()
+    
+    doc_responses = [
+        RagDocumentResponse(
+            id=doc.id,
+            filename=doc.filename,
+            title=doc.title,
+            description=doc.description,
+            file_size_bytes=doc.file_size_bytes,
+            chunks_count=doc.chunks_count,
+            document_type=doc.document_type,
+            embedding_model=doc.embedding_model,
+            is_indexed=bool(doc.is_indexed),
+            created_at=doc.created_at.isoformat() if doc.created_at else "",
+        )
+        for doc in documents
+    ]
+    
+    return RagDocumentListResponse(
+        documents=doc_responses,
+        total_count=len(documents),
+    )
+
+
+@router.get(
+    "/ingest/documents/{document_id}/chunks",
+    response_model=RagDocumentChunksResponse,
+    summary="Get all chunks of a specific document",
+    tags=["RAG Intelligence"],
+)
+def get_document_chunks(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Retrieve all text chunks extracted from a specific uploaded document.
+    
+    **Returns**
+    - Document metadata (id, filename, total_chunks)
+    - List of chunks with: chunk_index, content_hash, page numbers, etc.
+    
+    **Errors**
+    - ``404`` if the document does not exist
+    """
+    document = db.query(RagDocument).filter(RagDocument.id == document_id).first()
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document with id {document_id} not found",
+        )
+    
+    chunks = db.query(RagDocumentChunk).filter(
+        RagDocumentChunk.document_id == document_id
+    ).order_by(RagDocumentChunk.chunk_index).all()
+    
+    chunk_responses = [
+        RagDocumentChunkResponse(
+            id=chunk.id,
+            chunk_index=chunk.chunk_index,
+            content_hash=chunk.content_hash,
+            faiss_id=chunk.faiss_id,
+            start_page=chunk.start_page,
+            end_page=chunk.end_page,
+            created_at=chunk.created_at.isoformat() if chunk.created_at else "",
+        )
+        for chunk in chunks
+    ]
+    
+    return RagDocumentChunksResponse(
+        document_id=document.id,
+        filename=document.filename,
+        chunks=chunk_responses,
+        total_chunks=len(chunks),
+    )
+
+
+@router.delete(
+    "/ingest/documents/{document_id}",
+    summary="Delete an ingested document and rebuild FAISS index",
+    tags=["RAG Intelligence"],
+)
+def delete_document(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Delete a document and all its associated chunks from the database.
+    After deletion, the FAISS index will be rebuilt from remaining documents.
+    
+    **Note**: This operation requires re-ingestion of all remaining documents
+    to update the FAISS vector index.
+    
+    **Returns**
+    - Success message with document filename
+    
+    **Errors**
+    - ``404`` if the document does not exist
+    - ``503`` if FAISS rebuild fails
+    """
+    document = db.query(RagDocument).filter(RagDocument.id == document_id).first()
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document with id {document_id} not found",
+        )
+    
+    filename = document.filename
+    
+    try:
+        # Delete all chunks for this document
+        db.query(RagDocumentChunk).filter(
+            RagDocumentChunk.document_id == document_id
+        ).delete()
+        
+        # Delete the document
+        db.delete(document)
+        db.commit()
+        
+        # Rebuild FAISS index from remaining documents
+        remaining_documents = db.query(RagDocument).filter(
+            RagDocument.is_indexed == True
+        ).all()
+        
+        if remaining_documents:
+            remaining_paths = [doc.file_path for doc in remaining_documents]
+            try:
+                create_vector_store(remaining_paths)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Failed to rebuild FAISS index after deletion: {exc}",
+                )
+        else:
+            # If no documents remain, we could optionally clean up the FAISS index
+            # For now, we'll just leave it as-is
+            pass
+        
+        return {
+            "message": f"Document '{filename}' successfully deleted",
+            "document_id": document_id,
+        }
+    
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Failed to delete document: {str(e)}",
         )
 
 
